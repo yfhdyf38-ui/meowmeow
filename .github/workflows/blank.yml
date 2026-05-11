@@ -1,20 +1,223 @@
-name: Test SSH Connection
+name: Download and Serve
 
 on:
   workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL'
+        required: true
+      job_id:
+        description: 'Job ID'
+        required: true
+      chat_id:
+        description: 'Chat ID'
+        required: true
+      title:
+        description: 'Video title (base64)'
+        required: true
+      format_height:
+        description: 'Quality height (e.g. 720)'
+        required: false
+        default: '720'
+      audio_only:
+        description: 'Audio only (true/false)'
+        required: false
+        default: 'false'
+      quality_label:
+        description: 'Quality label'
+        required: false
+        default: 'HD'
+      webhook_url:
+        description: 'Webhook URL to notify bot'
+        required: true
 
 jobs:
-  test:
+  download:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
     steps:
-      - name: Ping server
-        run: ping -c 4 185.235.196.96 || echo "PING FAILED"
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
 
-      - name: Test SSH port 22
-        run: nc -zv 185.235.196.96 22 -w 10 && echo "PORT 22 OPEN" || echo "PORT 22 CLOSED"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Test HTTP port 8080
-        run: nc -zv 185.235.196.96 8080 -w 10 && echo "PORT 8080 OPEN" || echo "PORT 8080 CLOSED"
+      - name: Install dependencies
+        run: |
+          pip install yt-dlp
+          sudo apt-get install -y ffmpeg
 
-      - name: Curl test
-        run: curl -s --max-time 10 http://185.235.196.96:8080/health && echo "HTTP OK" || echo "HTTP FAILED"
+      - name: Write cookies
+        if: ${{ secrets.YOUTUBE_COOKIES != '' }}
+        run: |
+          echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+
+      - name: Download video/audio
+        id: download
+        run: |
+          import yt_dlp
+          import os
+          import sys
+          import base64
+          import re
+          import json
+          
+          url = "${{ inputs.url }}"
+          audio_only = "${{ inputs.audio_only }}" == "true"
+          height = int("${{ inputs.format_height }}" or "720")
+          
+          os.makedirs("downloads", exist_ok=True)
+          
+          cookie_opts = {}
+          if os.path.exists("cookies.txt"):
+              cookie_opts["cookiefile"] = "cookies.txt"
+          
+          if audio_only:
+              ydl_opts = {
+                  **cookie_opts,
+                  "format": "bestaudio[ext=m4a]/bestaudio/best",
+                  "outtmpl": "downloads/%(title).60s.%(ext)s",
+                  "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+                  "quiet": True,
+                  "no_warnings": True,
+              }
+          else:
+              fmt = (
+                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]"
+                  f"/bestvideo[height<={height}]+bestaudio"
+                  f"/best[height<={height}][ext=mp4]/best[height<={height}]"
+              )
+              ydl_opts = {
+                  **cookie_opts,
+                  "format": fmt,
+                  "outtmpl": "downloads/%(title).60s.%(ext)s",
+                  "merge_output_format": "mp4",
+                  "quiet": True,
+                  "no_warnings": True,
+              }
+          
+          with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+              info = ydl.extract_info(url, download=True)
+          
+          # Find output file
+          files = []
+          for f in os.listdir("downloads"):
+              fp = os.path.join("downloads", f)
+              if os.path.isfile(fp) and os.path.getsize(fp) > 1024:
+                  files.append((fp, os.path.getsize(fp)))
+          
+          if not files:
+              print("ERROR: No output file found")
+              sys.exit(1)
+          
+          best = max(files, key=lambda x: x[1])
+          file_path = best[0]
+          file_size = best[1]
+          file_name = os.path.basename(file_path)
+          
+          print(f"FILE_PATH={file_path}")
+          print(f"FILE_NAME={file_name}")
+          print(f"FILE_SIZE={file_size}")
+          
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"file_path={file_path}\n")
+              f.write(f"file_name={file_name}\n")
+              f.write(f"file_size={file_size}\n")
+        shell: python
+
+      - name: Commit file to repo
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          FILE_PATH="${{ steps.download.outputs.file_path }}"
+          FILE_NAME="${{ steps.download.outputs.file_name }}"
+          
+          git add "$FILE_PATH"
+          git commit -m "Add: $FILE_NAME [skip ci]"
+          git push
+          
+          # Build raw URL for Iran users
+          REPO="${{ github.repository }}"
+          BRANCH="main"
+          ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$FILE_NAME'))")
+          RAW_URL="https://github.com/${REPO}/raw/refs/heads/${BRANCH}/downloads/${ENCODED_NAME}"
+          
+          echo "raw_url=${RAW_URL}" >> "$GITHUB_OUTPUT"
+          echo "Raw URL: $RAW_URL"
+
+      - name: Notify bot webhook
+        run: |
+          import urllib.request
+          import json
+          import base64
+          import os
+          
+          job_id = "${{ inputs.job_id }}"
+          chat_id = "${{ inputs.chat_id }}"
+          title_b64 = "${{ inputs.title }}"
+          file_size = int("${{ steps.download.outputs.file_size }}")
+          quality_label = "${{ inputs.quality_label }}"
+          raw_url = "${{ steps.commit.outputs.raw_url }}"
+          webhook_url = "${{ inputs.webhook_url }}"
+          
+          def fmt_size(b):
+              for u in ["B","KB","MB","GB"]:
+                  if b < 1024: return f"{b:.1f} {u}"
+                  b /= 1024
+              return f"{b:.1f} TB"
+          
+          payload = {
+              "job_id": job_id,
+              "chat_id": chat_id,
+              "title": title_b64,
+              "file_size": fmt_size(file_size),
+              "quality": quality_label,
+              "download_url": raw_url,
+              "status": "success"
+          }
+          
+          data = json.dumps(payload).encode("utf-8")
+          req = urllib.request.Request(
+              webhook_url,
+              data=data,
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Webhook sent: {resp.status}")
+          except Exception as e:
+              print(f"Webhook error: {e}")
+        shell: python
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          import urllib.request
+          import json
+          
+          webhook_url = "${{ inputs.webhook_url }}"
+          payload = {
+              "job_id": "${{ inputs.job_id }}",
+              "chat_id": "${{ inputs.chat_id }}",
+              "status": "failed",
+              "error": "GitHub Actions download failed"
+          }
+          data = json.dumps(payload).encode("utf-8")
+          req = urllib.request.Request(
+              webhook_url, data=data,
+              headers={"Content-Type": "application/json"}, method="POST"
+          )
+          try:
+              urllib.request.urlopen(req, timeout=30)
+          except Exception as e:
+              print(f"Notify error: {e}")
+        shell: python
