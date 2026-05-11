@@ -1,0 +1,14 @@
+name: Test SSH Connection
+
+on:
+  workflow_dispatch:  # دستی اجرا میشه
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping server
+        run: ping -c 4 185.235.196.96
+
+      - name: Test SSH port
+        run: nc -zv 185.235.196.96 22 -w 10
