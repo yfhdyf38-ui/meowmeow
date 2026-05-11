@@ -1,14 +1,20 @@
 name: Test SSH Connection
 
 on:
-  workflow_dispatch:  # دستی اجرا میشه
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Ping server
-        run: ping -c 4 185.235.196.96
+        run: ping -c 4 185.235.196.96 || echo "PING FAILED"
 
-      - name: Test SSH port
-        run: nc -zv 185.235.196.96 22 -w 10
+      - name: Test SSH port 22
+        run: nc -zv 185.235.196.96 22 -w 10 && echo "PORT 22 OPEN" || echo "PORT 22 CLOSED"
+
+      - name: Test HTTP port 8080
+        run: nc -zv 185.235.196.96 8080 -w 10 && echo "PORT 8080 OPEN" || echo "PORT 8080 CLOSED"
+
+      - name: Curl test
+        run: curl -s --max-time 10 http://185.235.196.96:8080/health && echo "HTTP OK" || echo "HTTP FAILED"
